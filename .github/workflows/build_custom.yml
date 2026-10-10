@@ -1,0 +1,125 @@
+name: Build custom APK
+
+# Builds the "aku" variant of TachiyomiSY (app id eu.kanade.tachiyomi.sy.aku, named Aku),
+# which installs next to the regular TachiyomiSY app instead of replacing it.
+on:
+  push:
+    branches:
+      - 'feature/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build app
+    runs-on: 'ubuntu-24.04'
+
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6
+        with:
+          # By default only the default branch saves the Gradle cache, and these builds
+          # run on feature/** branches, so nothing was ever saved. Let them save it too.
+          cache-read-only: false
+
+      # Private repos build on 2-core / 7 GB runners: add swap and keep Gradle to one JVM and two workers,
+      # otherwise the build runs out of memory and the runner stops it (exit 143)
+      - name: Fit the build in the runner's memory
+        run: |
+          df -h / /mnt || true
+          # Disk: drop big preinstalled tools this build never uses (the Android SDK stays)
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/node_modules /usr/share/miniconda || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          # Memory: 6 GB of swap, on the second disk when there is one
+          swap=/swapfile2
+          if [ -d /mnt ] && [ -w /mnt ] || sudo test -d /mnt; then swap=/mnt/swapfile2; fi
+          sudo fallocate -l 6G $swap && sudo chmod 600 $swap
+          sudo mkswap $swap >/dev/null && sudo swapon $swap
+          df -h / /mnt || true
+          free -h
+          mkdir -p ~/.gradle
+          cat >> ~/.gradle/gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8
+          org.gradle.workers.max=2
+          kotlin.compiler.execution.strategy=in-process
+          PROPS
+
+      # A fixed signing key so each new build can be installed as an update over the previous one
+      - name: Use fixed debug signing key
+        run: |
+          mkdir -p ~/.android
+          cp .github/custom-debug.keystore ~/.android/debug.keystore
+
+      - name: Build app
+        shell: bash
+        run: |
+          set -o pipefail
+          # JitPack downloads are flaky, so retry a few times before giving up
+          extra=""
+          for attempt in 1 2 3 4; do
+            if ./gradlew assembleAku --stacktrace $extra 2>&1 | tee build.log; then exit 0; fi
+            # Gradle remembers failed downloads, so force it to try again
+            extra="--refresh-dependencies"
+            if ! grep -q "Could not resolve\|Could not find\|Could not GET\|Read timed out" build.log; then exit 1; fi
+            echo "Dependency download failed, retrying ($attempt)..."
+            sleep 45
+          done
+          exit 1
+
+      # Surface compile errors as annotations so they are readable without downloading logs
+      - name: Report build errors
+        if: failure()
+        shell: bash
+        run: |
+          { grep -E "^e: |^ERROR|FAILED$|\.sqm?[:(]|\.sq line|sqldelight" build.log; grep -A20 "What went wrong" build.log; } | head -120 > errors.txt || true
+          if [ ! -s errors.txt ]; then tail -80 build.log > errors.txt; fi
+          body=$(sed 's/%/%25/g' errors.txt | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error title=Build errors::${body}"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Aku-${{ github.sha }}
+          path: app/build/outputs/apk/aku/*.apk
+
+      # Publish the APK as a release (sy-r1, sy-r2, ...) so it can be downloaded directly on the device
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The next number after the newest sy-rN release (the Komikku-based Aku builds are plain rN)
+          last=$(gh api "repos/${{ github.repository }}/releases?per_page=100" --paginate -q '.[].tag_name' \
+            | sed -n 's/^sy-r\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
+          n=$(( ${last:-0} + 1 ))
+          tag="sy-r$n"
+          ls app/build/outputs/apk/aku/
+          for f in app/build/outputs/apk/aku/*.apk; do
+            abi=$(basename "$f" .apk | sed 's/^app-//; s/-aku.*//')
+            case "$abi" in arm64-v8a|universal) cp "$f" "Aku-SY-${abi}-r$n.apk" ;; esac
+          done
+          gh release create "$tag" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Aku SY r$n" \
+            --notes "TachiyomiSY-based Aku, built from branch ${{ github.ref_name }} at ${{ github.sha }}. Installs as Aku next to TachiyomiSY." \
+            --prerelease \
+            Aku-SY-*.apk

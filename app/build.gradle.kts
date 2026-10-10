@@ -68,6 +68,18 @@ android {
 
             buildConfigField("boolean", "INCLUDE_UPDATER", "false")
         }
+        // Aku: a release build signed with the build key, installed next to TachiyomiSY as its own app
+        create("aku") {
+            initWith(getByName("release"))
+            isMinifyEnabled = false
+            isShrinkResources = false
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks.add("release")
+            applicationIdSuffix = ".aku"
+            versionNameSuffix = "-aku"
+            resValue("string", "app_name", "Aku")
+            buildConfigField("boolean", "INCLUDE_UPDATER", "false")
+        }
         create("benchmark") {
             initWith(getByName("release"))
 
@@ -84,6 +96,8 @@ android {
         getByName("release").java.directories.add("src/release/java")
         getByName("foss").java.directories.add("src/foss/java")
         getByName("debug").java.directories.add("src/debug/java")
+        // Aku: no Firebase reporting
+        getByName("aku").java.directories.add("src/debug/java")
         getByName("benchmark").java.directories.add("src/debug/java")
         getByName("benchmark").res.directories.add("src/debug/res")
     }
